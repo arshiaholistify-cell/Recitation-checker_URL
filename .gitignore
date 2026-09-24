@@ -1,0 +1,20 @@
+# Secrets — never commit
+.env
+
+# Python
+__pycache__/
+**/__pycache__/
+*.pyc
+.venv/
+
+# Scratch/debug files from local testing
+test_ayah*.mp3
+output*.txt
+module_test*.txt
+debug*.txt
+
+# Local fine-tuning dataset builds / training output — built fresh
+# inside the training Space, never committed here
+finetune/quran_dataset/
+finetune/*_dataset/
+finetune/whisper-finetune-out/

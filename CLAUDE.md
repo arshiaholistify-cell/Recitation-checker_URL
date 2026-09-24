@@ -1,55 +1,95 @@
-# Recitation-checker_URL
+# Recitation Auto-Checker
 
-This repository is **empty** — it has no source of its own, and this file is its
-first commit. It exists as a placeholder for the recitation auto-checker.
+Python service that detects recitation errors in submitted Quran audio and
+writes them back into TarBee's database. Moved here from the TarBee repo
+(`Holistify-Islamic-Studies-App/recitation-checker/`) so it versions
+independently of the web app it serves.
 
-## Where the code actually lives
+Deployed to **Railway**, separately from TarBee. TarBee reaches it through the
+`RECITATION_CHECKER_URL` build placeholder.
 
-The working service is in the TarBee repo, at
-`Holistify-Islamic-Studies-App/recitation-checker/`:
+## What it does, and doesn't
 
-- `service.py` — FastAPI wrapper; `POST /check-recitation`
+Built on Tarteel AI's `tarteel-ai/whisper-base-ar-quran`, an MIT-licensed
+Whisper fine-tune for Quranic Arabic. It transcribes a recitation, diffs it word
+by word against the expected ayah text, and classifies mismatches as skipped,
+wrong or extra words. Results go into `is_recitation_errors` with
+`source='auto'` — the same table TarBee's manual word-pinning UI reads and
+displays.
+
+Two limits that matter before promising anything to a user:
+
+- It catches **content** errors — skipped, wrong, extra words, i.e. memorisation
+  and recitation accuracy. It does **not** detect acoustic tajweed violations
+  such as madd duration or ghunnah nasalization; Whisper emits words, not
+  fine-grained pronunciation analysis. Those still need a human ear through the
+  manual pinning tool.
+- It checks against **Hafs 'an Asim only**. The model and the reference text are
+  both Hafs; other riwayat (Warsh, Qaloon) produce unreliable results.
+
+## Layout
+
+- `service.py` — FastAPI wrapper, `POST /check-recitation`; reads `PORT`
+  (Railway injects it, defaults to 8090 locally)
 - `recitation_checker.py` — transcription and word-level diffing
 - `tajweed_checker.py` — acoustic pass
-- `Dockerfile` — deployed to Railway, which injects `PORT`
+- `Dockerfile` — the Railway image
+- `finetune/` — dataset building, training and evaluation scripts for the model
+  fine-tune; not part of the deployed service
+- `*.mp3`, `*.webm` — real recitation samples kept as test fixtures
 
-Work on it there, not here, unless and until someone decides to split it out.
+## The async design — don't undo it
 
-## What it does
+A full check (Whisper word-accuracy pass plus acoustic tajweed pass) takes 2–3+
+minutes on real audio. That is too long to hold an HTTP request open: something
+in the network path — proxy, mobile network or browser — was observed silently
+killing the connection well before completion, even though the server kept
+computing the whole time.
 
-Built on Tarteel AI's `tarteel-ai/whisper-base-ar-quran` (an MIT-licensed
-Whisper fine-tune for Quranic Arabic). It transcribes a submitted recitation,
-diffs it word by word against the expected ayah text, and classifies mismatches
-as skipped, wrong or extra words. Results are written to `is_recitation_errors`
-with `source='auto'` — the same table TarBee's manual word-pinning UI reads.
+So `POST /check-recitation` starts the work on a background thread and returns
+almost immediately. The frontend polls the `is_auto_check_jobs` table **through
+Supabase directly, not through this service**. See
+`islamic_studies_auto_check_jobs_migration.sql` in the TarBee repo.
 
-Scope limits worth knowing before promising anything to a user:
+Don't "simplify" this back into a synchronous request.
 
-- It catches **content** errors (skipped, wrong, extra words), not acoustic
-  tajweed violations like madd duration or ghunnah. Whisper emits words, not
-  fine-grained pronunciation analysis; those still need a human ear.
-- It checks against **Hafs 'an Asim only**. Other riwayat (Warsh, Qaloon) give
-  unreliable results.
+## Running it
 
-A full check takes 2–3+ minutes, too long to hold an HTTP request open, so
-`POST /check-recitation` starts background work and returns immediately; the app
-polls the `is_auto_check_jobs` table through Supabase directly. Don't turn that
-back into a synchronous request.
+```bash
+py -3.11 -m pip install -r requirements.txt
+py -3.11 -m uvicorn service:app --reload --port 8090
+```
+
+ffmpeg must be on PATH — the app records audio as webm/opus and librosa needs
+ffmpeg to decode it reliably. The Dockerfile installs it, and also installs the
+CPU-only torch build first, because a plain `pip install torch` on Linux pulls
+the multi-gigabyte CUDA wheel this container has no use for.
+
+`transformers` is pinned to `4.57.6`: `quran-muaalem` depends on a private
+internal (`_HIDDEN_STATES_START_POSITION`) that the 5.x rewrite removed, so an
+unpinned install breaks the import. Don't bump it without testing that.
+
+Standalone use on any audio file:
+
+```bash
+py -3.11 recitation_checker.py path/to/audio.mp3 112 1 1
+# args: audio_file  surah_number  ayah_start  ayah_end
+```
 
 ## Security
 
-**This repository is public.** The service uses a Supabase **service-role key**,
-which bypasses RLS. It belongs only in a local `.env` or in Railway's service
-variables — never committed here or anywhere else.
+**This repository is public.** The service authenticates to Supabase with the
+**service-role key**, which bypasses RLS entirely. It belongs only in a local
+`.env` (gitignored) or in Railway's service variables — never committed here,
+never pasted into chat, never shipped to the browser. `.env.example` is the
+template and must keep its key field empty.
 
-## If you're setting this repo up properly
+## Cross-repo note
 
-Two options, and the choice hasn't been made yet:
+The web app that consumes this lives in `Holistify-Islamic-Studies-App`
+(TarBee). Changes to the response shape, the `is_recitation_errors` columns or
+the `is_auto_check_jobs` contract affect both repos — the migrations for those
+tables live on the TarBee side.
 
-1. **Move** `recitation-checker/` out of the TarBee repo into this one, so the
-   Python service versions independently of the web app. The Railway deploy
-   would point here instead.
-2. **Retire** this repo, and leave the service where it is.
-
-Leaving it empty is the one option that doesn't help anyone — an unexplained
-empty repo is a trap for the next person.
+Commit history before the move stays in the TarBee repo; the shallow clone this
+move was made from couldn't carry it across.

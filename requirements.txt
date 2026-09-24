@@ -1,0 +1,26 @@
+# Pinned to the last pre-5.0 release: quran-muaalem's code depends on a
+# private transformers internal API removed in the 5.x rewrite
+# (_HIDDEN_STATES_START_POSITION), found empirically - unpinned
+# transformers installs 5.x and quran-muaalem fails to import.
+transformers==4.57.6
+torch
+librosa
+soundfile
+numpy
+scipy
+accelerate
+requests
+fastapi
+uvicorn[standard]
+pydantic
+supabase
+python-dotenv
+quran-muaalem
+quran-transcript
+# One of the model/processor loads above (Whisper's or Muaalem's) needs
+# protobuf for its tokenizer/processor config and wasn't pulling it in
+# transitively anymore once the dependency set changed - found live via
+# the real error message the previous fix (surfacing exceptions
+# properly instead of a bare 500) made visible: "ImportError: requires
+# the protobuf library but it was not found in your environment."
+protobuf
