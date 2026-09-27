@@ -45,6 +45,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client
 
+import recitation_checker
+# The module as well as the function: MODEL_NAME is read at call time,
+# not bound at import, so a `from ... import MODEL_NAME` here would
+# freeze whatever the value was when this module loaded and miss any
+# later reassignment (which is exactly what finetune/eval_real_recordings.py
+# does to A/B two checkpoints in one process).
 from recitation_checker import check_recitation
 from tajweed_checker import check_tajweed
 
@@ -204,6 +210,15 @@ def _run_check_job(recitation_id: str, error_type_ids: list[str] | None, school_
         result = {
             "recitation_id": row["id"],
             "riwaya": "hafs",  # only riwaya this model/reference text supports
+            # Which checkpoint produced this. Recorded because the model
+            # is now swappable at runtime (WHISPER_MODEL_ID — see
+            # recitation_checker.MODEL_NAME), and without it a stored
+            # result cannot be attributed afterwards: comparing a good
+            # run against a bad one means remembering what Railway was
+            # set to at the time, which nobody does. A/B-ing two
+            # checkpoints on the same audio is the main way this service
+            # gets evaluated, and it needs this to be possible at all.
+            "model": recitation_checker.MODEL_NAME,
             "assessment_type": row.get("assessment_type") or "recitation",
             "transcription": transcription,
             "duration_seconds": duration,
