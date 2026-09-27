@@ -59,7 +59,28 @@ _patch_extra_special_tokens_list_bug()
 # tune based on how it performs across more real recordings.
 LOW_CONFIDENCE_THRESHOLD = 0.5
 
-MODEL_NAME = "tarteel-ai/whisper-base-ar-quran"
+# The fine-tune this module's docstring describes, now that one exists.
+# Measured against the checkpoint it continues from, on 300 held-out
+# validation clips (finetune/eval_baseline.py's methodology, diacritics
+# normalised): word error rate 25.1% -> 10.2%, substitutions 672 -> 144,
+# deletions 282 -> 231. Insertions went 14 -> 19, which sounds like more
+# hallucination and is not: 14 insertions across 4,092 reference words
+# means the baseline was barely inventing words on that set to begin
+# with, so there was nothing there to improve. What it was doing was
+# mishearing them, and that is what the fine-tune fixed.
+#
+# Env-overridable so a rollback is a Railway variable change and a
+# restart, not a code deploy — this model sits in the path of every
+# auto-check, and the validation set above is drawn from the same corpus
+# as the training data, so it measures in-domain accuracy rather than
+# behaviour on the longer, less-common passages that motivated the run.
+# finetune/eval_real_recordings.py against the recordings in this repo
+# is the check for that, and is worth running before and after any
+# change to this value.
+#
+# The repo is private, so HF_TOKEN must be set wherever this runs; see
+# _load_model() below and finetune/README.md.
+MODEL_NAME = (os.environ.get("WHISPER_MODEL_ID") or "").strip() or "Holistify/whisper-base-ar-quran-finetuned-v2"
 _processor = None
 _model = None
 
