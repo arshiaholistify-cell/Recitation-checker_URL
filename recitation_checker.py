@@ -539,16 +539,40 @@ _ISTIADHAH_WORDS = normalize_arabic("أعوذ بالله من الشيطان ا�
 _BASMALA_WORDS = normalize_arabic("بسم الله الرحمن الرحيم").split()
 
 
-def _preamble_word_count(heard_words):
+def _expected_starts_with_basmala(norm_expected_words):
+    """Is the basmala part of the passage being checked, rather than an
+    opening said before it?
+
+    Al-Fatiha is the case that matters: there the basmala IS ayah 1.
+    Anywhere else it is a preamble with nothing to match against.
+    Compared through _diff_key so the same orthography tolerance used by
+    the main diff applies here."""
+    if len(norm_expected_words) < len(_BASMALA_WORDS):
+        return False
+    head = [_diff_key(w) for w in norm_expected_words[:len(_BASMALA_WORDS)]]
+    return head == [_diff_key(w) for w in _BASMALA_WORDS]
+
+
+def _preamble_word_count(heard_words, norm_expected_words=()):
     """If the transcription opens with the isti'adhah and/or basmala,
     return how many leading words to drop so the real diff starts at
     the actual ayah content (0 if no match). Whisper's transcription of
     these is rarely word-for-word identical (e.g. heard "راجيم" for
     "الرجيم") so this compares *characters*, not whole words, via
     difflib — a partial/fuzzy match still finds where the known phrase
-    ends within the noisy output."""
-    combined_ref = " ".join(_ISTIADHAH_WORDS + _BASMALA_WORDS)
-    window_word_count = min(len(heard_words), len(_ISTIADHAH_WORDS) + len(_BASMALA_WORDS) + 4)
+    ends within the noisy output.
+
+    The basmala is only treated as preamble when the expected text does
+    not itself begin with it. In Al-Fatiha it is ayah 1, and stripping
+    it there deleted the very words about to be checked: all four came
+    back "skipped word" on a correct recitation, and the diff, now
+    starting four words late, reported ayah 3's الرحمن الرحيم as wrong
+    as well. Every Al-Fatiha check produced those six false errors."""
+    reference_words = list(_ISTIADHAH_WORDS)
+    if not _expected_starts_with_basmala(list(norm_expected_words)):
+        reference_words += _BASMALA_WORDS
+    combined_ref = " ".join(reference_words)
+    window_word_count = min(len(heard_words), len(reference_words) + 4)
     window_words = heard_words[:window_word_count]
     window_str = " ".join(window_words)
 
@@ -565,6 +589,71 @@ def _preamble_word_count(heard_words):
         if consumed_chars >= last_end_char:
             break
     return words_to_strip
+
+
+# The disjointed letters that open 29 surahs are written as joined
+# glyphs (يسٓ, الٓمٓ) but recited as letter NAMES ("Ya Seen", "Alif Lam
+# Mim"), which is what Whisper transcribes. No amount of diacritic or
+# hamza folding bridges ياسين to يس, so ayah 1 of every one of those
+# surahs was a guaranteed false error — seen live on Ya-Sin, where يسٓ
+# came back "skipped word" although the reciter said it correctly.
+#
+# Keyed by the spoken form as a word tuple, since most are several words
+# heard against one written word. Applied only at the very start and
+# only when the expected first word is the matching glyph, so this can
+# never rewrite ordinary text that happens to look similar.
+_MUQATTAAT_SPOKEN = {
+    ("الف", "لام", "ميم"): "الم",
+    ("الف", "لام", "ميم", "صاد"): "المص",
+    ("الف", "لام", "را"): "الر",
+    ("الف", "لام", "ميم", "را"): "المر",
+    ("كاف", "ها", "يا", "عين", "صاد"): "كهيعص",
+    ("طا", "ها"): "طه",
+    ("طا", "سين", "ميم"): "طسم",
+    ("طا", "سين"): "طس",
+    ("ياسين",): "يس",
+    ("يا", "سين"): "يس",
+    ("صاد",): "ص",
+    ("حاميم",): "حم",
+    ("حا", "ميم"): "حم",
+    ("عين", "سين", "قاف"): "عسق",
+    ("قاف",): "ق",
+    ("نون",): "ن",
+}
+
+
+def _fold_muqattaat(heard_words, norm_expected_words):
+    """Collapse a spoken muqatta'at opening into the written glyph.
+
+    Returns (words, collapsed_count) where collapsed_count is how many
+    heard words became one, so the parallel confidence list can be kept
+    in step.
+    """
+    if not heard_words or not norm_expected_words:
+        return heard_words, 0
+    expected_first = norm_expected_words[0]
+    for spoken, written in _MUQATTAAT_SPOKEN.items():
+        if written != expected_first:
+            continue
+        if tuple(heard_words[:len(spoken)]) == spoken:
+            return [written] + heard_words[len(spoken):], len(spoken)
+    return heard_words, 0
+
+
+# اللات is the name of a pre-Islamic idol and appears exactly once in
+# the Qur'an (53:19). Whisper mishears الله as it — observed in a live
+# basmala, transcribed "في السم اللات الرحمن رحيم". Flagging the
+# reciter for a "wrong word" there is bad enough; rendering the divine
+# name as an idol's in a tool used by schools is worse, and the
+# transcript is shown to facilitators. Corrected unless the passage
+# genuinely contains the word, which only 53:19 does.
+_MISHEARD_SACRED_WORDS = {"اللات": "الله"}
+
+
+def _fix_misheard_sacred_words(heard_words, norm_expected_words):
+    if any(w in _MISHEARD_SACRED_WORDS for w in norm_expected_words):
+        return list(heard_words)
+    return [_MISHEARD_SACRED_WORDS.get(w, w) for w in heard_words]
 
 
 def _confidence_note(base_note, confidences):
@@ -722,9 +811,22 @@ def check_recitation(audio_path, surah_number, ayah_start, ayah_end, assessment_
         heard_words.extend(words)
         heard_confidences.extend([chunk_conf] * len(words))
 
-    strip_n = _preamble_word_count(heard_words)
+    strip_n = _preamble_word_count(heard_words, norm_expected_words)
     norm_heard_words = heard_words[strip_n:]
     heard_word_confidences = heard_confidences[strip_n:]
+
+    # Both run after the preamble strip: a muqatta'at opening is the
+    # first thing said after the isti'adhah/basmala, not before it.
+    norm_heard_words, collapsed = _fold_muqattaat(norm_heard_words, norm_expected_words)
+    if collapsed > 1:
+        # Keep the confidence list parallel — the collapsed word takes
+        # the lowest confidence of the words it replaced, so a shaky
+        # opening still reads as shaky.
+        heard_word_confidences = (
+            [min(heard_word_confidences[:collapsed])] + heard_word_confidences[collapsed:]
+            if heard_word_confidences[:collapsed] else heard_word_confidences
+        )
+    norm_heard_words = _fix_misheard_sacred_words(norm_heard_words, norm_expected_words)
 
     # The matcher itself runs on the loosened keys (alef-ambiguity
     # insensitive); every downstream use of norm_expected_words/
