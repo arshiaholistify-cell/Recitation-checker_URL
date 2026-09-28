@@ -147,7 +147,15 @@ def check_recitation_aligned(audio_path, surah_number, ayah_start, ayah_end,
     result = muaalem([wave], [phonetizer_out], sampling_rate=16000)[0]
     pred_phonemes = result.phonemes.text
 
-    opcodes = difflib.SequenceMatcher(None, ref_phonemes, pred_phonemes).get_opcodes()
+    # autojunk=False is required, not a tuning choice. difflib treats any
+    # element occurring in more than 1% of a sequence of 200+ as junk and
+    # refuses to anchor on it — a heuristic for lines of source code. A
+    # phoneme string draws on ~30 symbols, so every one of them is
+    # "popular" and the matcher is left with no anchors: on Al-Fatiha 1-7
+    # it collapsed thirteen boundary edits into one 54-phoneme replace
+    # spanning six correctly recited words.
+    opcodes = difflib.SequenceMatcher(
+        None, ref_phonemes, pred_phonemes, autojunk=False).get_opcodes()
     tally = _mismatch_by_word(spans, opcodes, len(ref_phonemes))
 
     errors = []
