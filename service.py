@@ -51,6 +51,7 @@ import recitation_checker
 # freeze whatever the value was when this module loaded and miss any
 # later reassignment (which is exactly what finetune/eval_real_recordings.py
 # does to A/B two checkpoints in one process).
+from alignment_checker import check_recitation_aligned
 from recitation_checker import check_recitation
 from tajweed_checker import check_tajweed
 
@@ -167,11 +168,36 @@ def _run_check_job(recitation_id: str, error_type_ids: list[str] | None, school_
             if not allowed_error_types:
                 raise RuntimeError("None of the selected error type(s) exist anymore.")
 
-        transcription, duration, errors = check_recitation(
-            tmp_path, row["surah_number"], row["ayah_start"], row["ayah_end"],
-            assessment_type=row.get("assessment_type") or "recitation",
-            allowed_error_types=allowed_error_types,
-        )
+        # Word accuracy runs one of two ways, selected per deployment so
+        # both can be pointed at the same recording and compared.
+        #
+        #   transcribe  (default)  Whisper transcribes freely, the text is
+        #                          diffed against the expected words.
+        #   align                  the audio is aligned against the
+        #                          expected phonemes; a word is flagged
+        #                          only when its own sounds are absent.
+        #                          See alignment_checker.py.
+        #
+        # Still opt-in: alignment has been exercised against synthetic
+        # deviations, not yet against a shelf of real recordings, and
+        # this sits in front of every student's submission.
+        word_check_mode = (os.environ.get("WORD_CHECK_MODE") or "transcribe").strip().lower()
+        if word_check_mode == "align":
+            errors, ref_phonemes, pred_phonemes = check_recitation_aligned(
+                tmp_path, row["surah_number"], row["ayah_start"], row["ayah_end"],
+                allowed_error_types=allowed_error_types,
+            )
+            # The phoneme pair is this mode's transcript: it is what the
+            # comparison actually ran on, so a stored result stays
+            # debuggable the way a Whisper transcript is.
+            transcription = f"[aligned] expected: {ref_phonemes}\nheard: {pred_phonemes}"
+            duration = 0.0
+        else:
+            transcription, duration, errors = check_recitation(
+                tmp_path, row["surah_number"], row["ayah_start"], row["ayah_end"],
+                assessment_type=row.get("assessment_type") or "recitation",
+                allowed_error_types=allowed_error_types,
+            )
         # Separate model, separate pipeline (acoustic madd/elongation
         # checking - see tajweed_checker.py's module docstring for why
         # this only checks madd length, not qalqalah/ghunnah/idgham/
@@ -219,6 +245,10 @@ def _run_check_job(recitation_id: str, error_type_ids: list[str] | None, school_
             # checkpoints on the same audio is the main way this service
             # gets evaluated, and it needs this to be possible at all.
             "model": recitation_checker.MODEL_NAME,
+            # Which of the two word-accuracy methods produced these, for
+            # the same reason "model" is recorded: a result nobody can
+            # attribute afterwards cannot be compared against another.
+            "word_check_mode": word_check_mode,
             "assessment_type": row.get("assessment_type") or "recitation",
             "transcription": transcription,
             "duration_seconds": duration,
