@@ -30,8 +30,8 @@ import os
 
 import evaluate
 import torch
-from datasets import load_dataset
-from huggingface_hub import HfApi, snapshot_download
+from datasets import DatasetDict, concatenate_datasets, load_dataset
+from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 from transformers import (
     Seq2SeqTrainer,
     Seq2SeqTrainingArguments,
@@ -41,6 +41,32 @@ from transformers import (
 from transformers.trainer_utils import get_last_checkpoint
 
 BASE_MODEL = "tarteel-ai/whisper-base-ar-quran"
+
+
+def _load_dataset_robust(hub_dataset_id):
+    """load_dataset(hub_dataset_id) scans every split's parquet files
+    together in one combined pass, which can throw a spurious "Couldn't
+    deserialize thrift ... Deserializing page header failed" under
+    memory pressure from having many files open in that scan at once —
+    not real file corruption. preprocess.py's _consolidate() hit and
+    diagnosed this exact error already (see its comments) and works
+    around it by loading one file at a time and concatenating; doing the
+    same here avoids the crash without needing to touch the pushed
+    dataset at all.
+    """
+    api = HfApi()
+    files = api.list_repo_files(hub_dataset_id, repo_type="dataset")
+    result = {}
+    for split in ("train", "validation"):
+        split_files = sorted(f for f in files if f.endswith(".parquet") and f"{split}-" in f.rsplit("/", 1)[-1])
+        if not split_files:
+            raise RuntimeError(f"No parquet files found for split {split!r} in {hub_dataset_id}")
+        pieces = []
+        for filename in split_files:
+            local_path = hf_hub_download(repo_id=hub_dataset_id, repo_type="dataset", filename=filename)
+            pieces.append(load_dataset("parquet", data_files=local_path, split="train"))
+        result[split] = concatenate_datasets(pieces) if len(pieces) > 1 else pieces[0]
+    return DatasetDict(result)
 
 
 class DataCollatorSpeechSeq2SeqWithPadding:
@@ -80,7 +106,7 @@ def main():
     # per-example CPU work left to do here, so this loads fast
     # regardless of dataset size and everything from here on actually
     # needs the GPU tier this script runs on.
-    dataset = load_dataset(args.hub_dataset_id)
+    dataset = _load_dataset_robust(args.hub_dataset_id)
 
     model = WhisperForConditionalGeneration.from_pretrained(BASE_MODEL)
     model.generation_config.language = None
@@ -117,6 +143,16 @@ def main():
     # checkpoint survives on the Hub across restarts since local disk
     # doesn't.
     SAVE_STEPS = 50
+    # A full-validation generation eval (3,102 clips, ~388 batches at
+    # ~4s each) took ~25 min and was running every SAVE_STEPS steps —
+    # most of a day of billed T4 time. Eval on a small random slice
+    # (validation was shuffled before splitting) and much less often;
+    # checkpoints stay frequent since those are what survive restarts.
+    # load_best_model_at_end is off because it requires save_steps to be
+    # a multiple of eval_steps, which would force checkpoints down to
+    # the eval interval; the final model is just the last step.
+    EVAL_STEPS = 500
+    EVAL_SUBSET = 300
     # /data is the Space's persistent storage bucket (survives container
     # restarts, unlike the rest of the filesystem) — writing local
     # checkpoints there too means a restart can resume from disk
@@ -131,7 +167,7 @@ def main():
         num_train_epochs=args.epochs,
         fp16=torch.cuda.is_available(),
         eval_strategy="steps",
-        eval_steps=SAVE_STEPS,
+        eval_steps=EVAL_STEPS,
         save_strategy="steps",
         save_steps=SAVE_STEPS,
         save_total_limit=2,
@@ -139,9 +175,12 @@ def main():
         predict_with_generate=True,
         generation_max_length=225,
         logging_steps=25,
-        load_best_model_at_end=True,
-        metric_for_best_model="wer",
-        greater_is_better=False,
+        # Resuming from checkpoint-N otherwise makes Trainer replay the
+        # dataloader from the start and discard every batch already
+        # consumed, purely to restore data order — ~39,000 examples of
+        # ~1 MB log-mel features at checkpoint-2450, before step one.
+        # Optimizer, scheduler and step count still resume exactly.
+        ignore_data_skip=True,
         push_to_hub=not args.dry_run,
         hub_model_id=args.hub_model_id,
         hub_private_repo=True,
@@ -152,7 +191,7 @@ def main():
         args=training_args,
         model=model,
         train_dataset=dataset["train"],
-        eval_dataset=dataset["validation"],
+        eval_dataset=dataset["validation"].select(range(min(EVAL_SUBSET, len(dataset["validation"])))),
         data_collator=data_collator,
         compute_metrics=compute_metrics,
         processing_class=processor.feature_extractor,

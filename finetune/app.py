@@ -37,6 +37,11 @@ Optional Space variable for one-off dataset repair:
                     phase 1 or 2. Remove it and restart again afterward
                     to resume normal operation.
 
+Before training, every run verifies the checkpoints on persistent
+storage and quarantines any that cannot be loaded — see
+verify_checkpoints(). No variable needed; the report lands on the status
+page and in the logs either way.
+
 Once the status page shows "complete" (training done) or "ready_for_gpu"
 (phase 1 done, waiting on you to switch hardware), or "failed" — check
 logs — switch the Space's hardware back to CPU Basic (free) or pause it
@@ -45,15 +50,132 @@ running.
 """
 
 import os
+import re
+import shutil
+import signal
 import subprocess
 import sys
 import threading
+import traceback
 
 from fastapi import FastAPI
 from huggingface_hub import HfApi
+from huggingface_hub.utils import RepositoryNotFoundError
 
 app = FastAPI()
 STATE = {"status": "starting", "detail": ""}
+
+OUTPUT_DIR = "/data/whisper-finetune-out" if os.path.isdir("/data") else "./whisper-finetune-out"
+
+# Keep the Hugging Face caches on the container's OWN disk, not on /data.
+#
+# Spaces points HF_HOME at persistent storage when it is attached, which
+# puts both the downloaded parquet and the Arrow files datasets converts
+# them into on /data. /data is a network-backed FUSE mount: statvfs on it
+# reports a fictional 42 PiB, so a quota ceiling there is invisible, and
+# datasets memory-maps those Arrow files rather than reading them. When a
+# page fault on an mmap'd region cannot be served — a storage hiccup, a
+# quota wall, a file truncated by an earlier interrupted write — the
+# kernel delivers SIGBUS and the process dies instantly with no
+# traceback. That is exactly how training kept dying, immediately after
+# the dataloader started touching feature pages.
+#
+# Local disk has hundreds of GiB free and mmaps normally. The cost is
+# that a container restart re-downloads the dataset, since /tmp does not
+# survive one; checkpoints stay on /data, which is what actually needs to
+# persist. To trade that back later, move HF_HUB_CACHE (the parquet) to
+# /data and leave HF_DATASETS_CACHE (the mmap'd Arrow) here.
+def probe_storage(path):
+    """Write and read back a byte, because /data lies in both directions.
+
+    statvfs on that FUSE mount reports a fictional 42 PiB whether it is
+    healthy or dead, and os.path.isdir() still answers True for a mount
+    whose daemon has disconnected. Only touching it tells the truth: a
+    dead mount raises OSError 107, ENOTCONN ("Transport endpoint is not
+    connected"), which is the readable half of the same fault that
+    reaches memory-mapped reads as an unsurvivable SIGBUS.
+    """
+    if not os.path.isdir(path):
+        return "absent"
+    probe = os.path.join(path, ".storage-probe")
+    try:
+        with open(probe, "w") as handle:
+            handle.write("ok")
+        with open(probe) as handle:
+            got = handle.read()
+        os.remove(probe)
+    except OSError as exc:
+        return f"UNUSABLE — {type(exc).__name__}: {exc}"
+    return "writable" if got == "ok" else "UNUSABLE — read-back mismatch"
+
+
+# The two caches are split deliberately, because they fail differently.
+#
+# The platform recycles this container mid-run — the logs carry the
+# literal "an error occurred when try to find container ...: not found"
+# that train.py's comments describe. Everything on /tmp dies with it, so
+# putting the ~15 GB of downloaded parquet there means re-downloading the
+# whole dataset on every recycle, and training never reaches its first
+# checkpoint. That download therefore goes on /data, which survives.
+#
+# The Arrow files datasets converts parquet into are a different matter:
+# those are memory-mapped, and a page fault that cannot be served — which
+# is what a teardown does to the /data FUSE mount while this process is
+# still alive — delivers SIGBUS, killing training outright with no
+# traceback. They stay on local disk, where a mount cannot vanish
+# underneath them. Re-converting after a recycle costs a couple of
+# minutes; re-downloading costs the whole run.
+#
+# HF_HOME is set too, not just the individual caches: several paths are
+# DERIVED from it, HF_XET_CACHE ($HF_HOME/xet) among them, and the
+# Space's own HF_HOME variable points at /data.
+LOCAL_HF_CACHE = "/tmp/hf-cache"
+PERSISTENT_HF_CACHE = "/data/hf-cache"
+
+os.environ["HF_HOME"] = LOCAL_HF_CACHE
+os.environ["HF_DATASETS_CACHE"] = os.path.join(LOCAL_HF_CACHE, "datasets")
+os.environ["HF_XET_CACHE"] = os.path.join(LOCAL_HF_CACHE, "xet")
+# Only trust /data if it answers a real write; a dead mount still passes
+# isdir(), and falling back to local disk costs a re-download but keeps
+# the run alive, which is the better failure.
+if probe_storage("/data") == "writable":
+    os.environ["HF_HUB_CACHE"] = os.path.join(PERSISTENT_HF_CACHE, "hub")
+else:
+    os.environ["HF_HUB_CACHE"] = os.path.join(LOCAL_HF_CACHE, "hub")
+for _cache in ("HF_DATASETS_CACHE", "HF_HUB_CACHE", "HF_XET_CACHE"):
+    os.makedirs(os.environ[_cache], exist_ok=True)
+
+# Run the integrity check in a CHILD process, never in this one. A
+# truncated memory-mapped file does not raise a Python exception when
+# read — it delivers SIGBUS, which kills the process outright. In-process
+# that would take the whole Space down with no report; in a child, the
+# death shows up as a return code that describe_exit() names, which is
+# exactly the evidence we are after.
+_SAFETENSORS_CHECK = (
+    "import os, sys\n"
+    "from safetensors.torch import load_file\n"
+    "path = sys.argv[1]\n"
+    "print('file size: %d bytes' % os.path.getsize(path), flush=True)\n"
+    "tensors = load_file(path)\n"
+    "print('loaded %d tensors, SAFETENSORS OK' % len(tensors), flush=True)\n"
+)
+
+
+def describe_exit(code):
+    """Render a subprocess return code so a crash is distinguishable
+    from a kill. A process killed by a signal prints nothing of its own
+    — no traceback, no last words — so without this the logs look
+    identical to a step that stopped mid-sentence. SIGKILL means the
+    kernel's OOM killer; SIGBUS means a memory-mapped file could not be
+    served (truncated file, or the filesystem behind it out of space)."""
+    if code < 0:
+        try:
+            name = signal.Signals(-code).name
+        except ValueError:
+            name = f"signal {-code}"
+        hints = {"SIGKILL": " (kernel OOM killer)", "SIGBUS": " (bad mmap: truncated file or full disk)"}
+        return f"killed by {name}{hints.get(name, '')}"
+    return f"exit code {code}"
 
 
 def run_streamed(cmd):
@@ -74,24 +196,162 @@ def run_streamed(cmd):
     for line in proc.stdout:
         print(line, end="", flush=True)
         tail.append(line.rstrip("\n"))
-        tail = tail[-60:]
+        # Kept generous: tqdm redraws can fill this buffer on their own
+        # and push a real traceback out of it.
+        tail = tail[-200:]
     proc.wait()
+    tail.append(f"[process exited: {describe_exit(proc.returncode)}]")
     return proc.returncode, "\n".join(tail)
 
 
+def _disk_report():
+    lines = ["caches:"]
+    for var in ("HF_HOME", "HF_DATASETS_CACHE", "HF_HUB_CACHE"):
+        lines.append(f"  {var}={os.environ.get(var, '(unset)')}")
+    # /data is a FUSE mount whose statvfs numbers are fictional, so its
+    # row below says nothing about the real quota — read it as "present",
+    # not as free space.
+    lines.append(f"persistent storage (/data): {probe_storage('/data')}")
+    lines.append("disk:")
+    for path in ("/", "/data", "/tmp", LOCAL_HF_CACHE, os.path.expanduser("~/.cache/huggingface"), "/dev/shm"):
+        if not os.path.exists(path):
+            lines.append(f"  {path}: (absent)")
+            continue
+        usage = shutil.disk_usage(path)
+        pct = 100.0 * usage.used / usage.total if usage.total else 0.0
+        lines.append(f"  {path}: {usage.free / 1024 ** 3:.1f} GiB free of {usage.total / 1024 ** 3:.1f} GiB ({pct:.0f}% used)")
+    return lines
+
+
+def _dir_size(path):
+    total = 0
+    for root, _dirs, names in os.walk(path):
+        for name in names:
+            full = os.path.join(root, name)
+            if os.path.isfile(full):
+                total += os.path.getsize(full)
+    return total
+
+
+def _tree_report(path):
+    lines = [f"contents of {path}:"]
+    if not os.path.isdir(path):
+        lines.append("  MISSING — no local checkpoints on persistent storage")
+        return lines
+    for name in sorted(os.listdir(path)):
+        full = os.path.join(path, name)
+        if os.path.isdir(full):
+            lines.append(f"  {name}/  {_dir_size(full) / 1024 ** 2:.0f} MiB")
+        else:
+            lines.append(f"  {name}  {os.path.getsize(full) / 1024 ** 2:.1f} MiB")
+    return lines
+
+
+def _checkpoint_dirs(path):
+    """Checkpoint directories, oldest first, by step number."""
+    if not os.path.isdir(path):
+        return []
+    found = []
+    for name in os.listdir(path):
+        match = re.fullmatch(r"checkpoint-(\d+)", name)
+        if match and os.path.isdir(os.path.join(path, name)):
+            found.append((int(match.group(1)), os.path.join(path, name)))
+    return [full for _step, full in sorted(found)]
+
+
+def _quarantine(path):
+    """Rename a checkpoint out of the way instead of deleting it.
+
+    get_last_checkpoint() in train.py only recognises directories named
+    checkpoint-<step>, so a renamed one is invisible to the resume logic
+    while staying on disk for inspection. Renaming also cannot lose work
+    the way rm -rf can, which matters when the thing being judged
+    "corrupt" is the only record of 2,450 steps of training."""
+    target = path.replace("checkpoint-", "corrupt-checkpoint-")
+    suffix = 1
+    while os.path.exists(target):
+        suffix += 1
+        target = path.replace("checkpoint-", "corrupt-checkpoint-") + f".{suffix}"
+    os.rename(path, target)
+    return target
+
+
+def verify_checkpoints():
+    """Find the newest checkpoint that actually loads, newest first.
+
+    A checkpoint whose model.safetensors was truncated — by a container
+    kill landing mid-save, or by the filesystem filling up — does not
+    fail cleanly. safetensors memory-maps the file, and reading past a
+    truncated end delivers SIGBUS, killing the process with no traceback
+    at all. That is indistinguishable from a hang in the logs, and it
+    repeats on every restart, so the run can never get past its own
+    resume.
+
+    Each candidate is therefore loaded in a CHILD process: a SIGBUS
+    there is contained and reported as a return code rather than taking
+    this Space down. Anything that fails is renamed aside so the next
+    restart resumes from the newest checkpoint that works.
+
+    Returns (report_lines, usable_checkpoint_or_None).
+    """
+    report = _disk_report() + [""] + _tree_report(OUTPUT_DIR) + [""]
+    candidates = list(reversed(_checkpoint_dirs(OUTPUT_DIR)))
+    if not candidates:
+        report.append("no local checkpoints — train.py will try the Hub, or start fresh")
+        return report, None
+
+    for path in candidates:
+        weights = os.path.join(path, "model.safetensors")
+        if not os.path.isfile(weights):
+            reason = "no model.safetensors"
+        else:
+            code, tail = run_streamed([sys.executable, "-c", _SAFETENSORS_CHECK, weights])
+            if code == 0:
+                report.append(f"{os.path.basename(path)}: OK — resuming from this one")
+                return report, path
+            reason = describe_exit(code)
+            report.extend("  " + line for line in tail.splitlines())
+        try:
+            moved = _quarantine(path)
+            report.append(f"{os.path.basename(path)}: UNUSABLE ({reason}) — renamed to {os.path.basename(moved)}")
+        except OSError as exc:
+            report.append(f"{os.path.basename(path)}: UNUSABLE ({reason}) — could NOT rename it ({exc})")
+            return report, None
+
+    report.append("every local checkpoint failed to load — train.py will try the Hub, or start fresh")
+    return report, None
+
+
 def dataset_already_processed(hub_dataset_id):
-    try:
-        HfApi().dataset_info(hub_dataset_id)
-        return True
-    except Exception:
-        # Covers "doesn't exist yet" (the expected case on a fresh
-        # phase-1 run) and any transient lookup error alike — either
-        # way, the safe thing is to (re)do phase 1 rather than assume
-        # a training phase has something valid to load.
-        return False
+    """True if the processed dataset is already on the Hub.
+
+    Only a genuine "not found" counts as "needs phase 1". Anything else
+    — an expired HF_TOKEN, a Hub 5xx — is allowed to propagate: on a GPU
+    tier, mistaking a transient lookup failure for a fresh run silently
+    starts a ~day-long CPU preprocessing job on billed GPU hardware.
+    Note that the Hub also answers 404 for a private repo the current
+    token cannot see, so a token problem can still surface here as
+    RepositoryNotFoundError — if this reports "building_dataset" on a
+    Space you know has already been preprocessed, suspect the token
+    before suspecting the dataset."""
+    HfApi().dataset_info(hub_dataset_id)
+    return True
 
 
 def run_job():
+    """Thread entrypoint — keeps STATE truthful if _run_job raises.
+
+    Without this, an exception in the job thread leaves the status page
+    reporting "starting" forever while nothing is running, which reads
+    exactly like a hung step."""
+    try:
+        _run_job()
+    except Exception:
+        STATE["status"] = "failed"
+        STATE["detail"] = "Job crashed:\n" + traceback.format_exc()
+
+
+def _run_job():
     hub_model_id = os.environ.get("HUB_MODEL_ID")
     hub_dataset_id = os.environ.get("HUB_DATASET_ID")
     if not hub_model_id or not hub_dataset_id:
@@ -122,7 +382,12 @@ def run_job():
         STATE["detail"] = "Re-consolidated the processed dataset. Remove the REPAIR_DATASET variable and restart to resume training."
         return
 
-    if not dataset_already_processed(hub_dataset_id):
+    try:
+        processed = dataset_already_processed(hub_dataset_id)
+    except RepositoryNotFoundError:
+        processed = False
+
+    if not processed:
         # Phase 1 — CPU-only, meant to run on cheap/free CPU hardware.
         # Stops here rather than continuing to training: the point is
         # to never let the slow (~a day) preprocessing step run on a
@@ -153,13 +418,33 @@ def run_job():
     # Phase 2 — the dataset already exists on the Hub (either from an
     # earlier phase-1 run on this same Space before a hardware switch,
     # or reused as-is), so skip straight to the GPU-only training step.
+    storage = probe_storage("/data")
+    if storage.startswith("UNUSABLE"):
+        # Training would write every checkpoint to this mount, so there
+        # is nothing to be gained by starting: it dies minutes later with
+        # a SIGBUS that looks like a hang. Say so plainly instead.
+        STATE["status"] = "failed"
+        STATE["detail"] = (
+            f"Persistent storage /data is not usable: {storage}\n\n"
+            "This is the Space's storage mount, not this code. A dropped FUSE mount does not "
+            "recover in place — RESTART the Space to get a fresh container. If it keeps "
+            "happening, move training output off /data and rely on the Hub checkpoint pushes."
+        )
+        return
+
+    STATE["status"] = "checking_checkpoints"
+    report, usable = verify_checkpoints()
+    checkpoint_report = "\n".join(report)
+    print(checkpoint_report, flush=True)
+    STATE["detail"] = checkpoint_report
+
     STATE["status"] = "training"
     code, tail = run_streamed(
         [sys.executable, "train.py", "--hub-dataset-id", hub_dataset_id, "--hub-model-id", hub_model_id]
     )
     if code != 0:
         STATE["status"] = "failed"
-        STATE["detail"] = "Training failed:\n" + tail
+        STATE["detail"] = "Training failed:\n" + tail + "\n\n--- checkpoint check before this run ---\n" + checkpoint_report
         return
 
     STATE["status"] = "complete"
