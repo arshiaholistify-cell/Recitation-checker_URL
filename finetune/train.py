@@ -187,11 +187,13 @@ def main():
         hub_strategy="checkpoint",
     )
 
+    eval_subset = dataset["validation"].select(range(min(EVAL_SUBSET, len(dataset["validation"]))))
+
     trainer = Seq2SeqTrainer(
         args=training_args,
         model=model,
         train_dataset=dataset["train"],
-        eval_dataset=dataset["validation"].select(range(min(EVAL_SUBSET, len(dataset["validation"])))),
+        eval_dataset=eval_subset,
         data_collator=data_collator,
         compute_metrics=compute_metrics,
         processing_class=processor.feature_extractor,
@@ -221,7 +223,12 @@ def main():
         except Exception as exc:
             print(f"No resumable checkpoint found on the Hub ({type(exc).__name__}: {exc}) — starting fresh.", flush=True)
 
-    print(f"Training on {len(dataset['train'])} clips, validating on {len(dataset['validation'])}...")
+    print(
+        f"Training on {len(dataset['train'])} clips for {args.epochs} epochs; "
+        f"evaluating on {len(eval_subset)} of {len(dataset['validation'])} validation clips "
+        f"every {EVAL_STEPS} steps.",
+        flush=True,
+    )
     trainer.train(resume_from_checkpoint=resume_from)
     if args.dry_run:
         print("Dry run — skipping push to Hub.")

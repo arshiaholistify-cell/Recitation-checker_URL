@@ -40,7 +40,16 @@ Optional Space variable for one-off dataset repair:
 Before training, every run verifies the checkpoints on persistent
 storage and quarantines any that cannot be loaded — see
 verify_checkpoints(). No variable needed; the report lands on the status
-page and in the logs either way.
+page and in the logs either way. That report now also carries the
+surviving checkpoint's step count and its full eval WER history, so
+"did this training help, and at which step was it best" is answerable
+from the status page alone.
+
+If that checkpoint has already completed the epochs being asked for,
+the status goes to "already_complete" and training is SKIPPED, because
+resuming a finished run trains nothing while still billing GPU time.
+Raise the EPOCHS variable to continue it, clear the checkpoints to start
+over, or set FORCE_TRAIN=true to run regardless.
 
 Once the status page shows "complete" (training done) or "ready_for_gpu"
 (phase 1 done, waiting on you to switch hardware), or "failed" — check
@@ -49,6 +58,7 @@ if nothing further is queued, since GPU tiers bill per minute while
 running.
 """
 
+import json
 import os
 import re
 import shutil
@@ -67,7 +77,16 @@ STATE = {"status": "starting", "detail": ""}
 
 OUTPUT_DIR = "/data/whisper-finetune-out" if os.path.isdir("/data") else "./whisper-finetune-out"
 
-# Keep the Hugging Face caches on the container's OWN disk, not on /data.
+# How many epochs this Space is asking for. Passed to train.py explicitly
+# on every run rather than left to its default, so that this is the only
+# place the number lives: the completion check below compares a
+# checkpoint's progress against it, and a check reading one number while
+# training reads another is worse than no check at all. Override with an
+# EPOCHS Space variable to extend a finished run.
+EPOCHS = int(os.environ.get("EPOCHS", "2"))
+
+# Keep the memory-mapped Arrow cache on the container's OWN disk, not
+# on /data.
 #
 # Spaces points HF_HOME at persistent storage when it is attached, which
 # puts both the downloaded parquet and the Arrow files datasets converts
@@ -80,11 +99,12 @@ OUTPUT_DIR = "/data/whisper-finetune-out" if os.path.isdir("/data") else "./whis
 # traceback. That is exactly how training kept dying, immediately after
 # the dataloader started touching feature pages.
 #
-# Local disk has hundreds of GiB free and mmaps normally. The cost is
-# that a container restart re-downloads the dataset, since /tmp does not
-# survive one; checkpoints stay on /data, which is what actually needs to
-# persist. To trade that back later, move HF_HUB_CACHE (the parquet) to
-# /data and leave HF_DATASETS_CACHE (the mmap'd Arrow) here.
+# Local disk has hundreds of GiB free and mmaps normally, so the Arrow
+# cache lives there. Where the downloaded parquet goes is a separate
+# decision, taken just below: that one goes ON /data, because it is not
+# memory-mapped and losing it to a container recycle costs a ~15 GB
+# re-download. Checkpoints stay on /data too — they are the thing that
+# actually has to survive.
 def probe_storage(path):
     """Write and read back a byte, because /data lies in both directions.
 
@@ -322,6 +342,62 @@ def verify_checkpoints():
     return report, None
 
 
+def training_progress(checkpoint):
+    """What a checkpoint says about how far its run actually got.
+
+    trainer_state.json sits in every checkpoint and carries the whole
+    history — global_step, how many epochs were asked for and how many
+    completed, and every eval logged along the way. It costs nothing to
+    read and answers the question the logs never did: is there any work
+    left to do?
+
+    Returns the parsed state, or None if it cannot be read (an old
+    checkpoint predating the file, or one truncated by the same kind of
+    interrupted write verify_checkpoints() exists to catch).
+    """
+    path = os.path.join(checkpoint, "trainer_state.json")
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path) as handle:
+            return json.load(handle)
+    except (OSError, ValueError) as exc:
+        print(f"could not read {path}: {type(exc).__name__}: {exc}", flush=True)
+        return None
+
+
+def describe_progress(state):
+    """Summarise a trainer_state.json, eval history included.
+
+    The WER history is the whole point of printing this. It is recorded
+    in every checkpoint, so the question this project has actually been
+    asking — did fine-tuning help, and at which step was the model at
+    its best — is answerable from disk, with no GPU and no inference
+    run. Before this it was only ever reachable by loading the model and
+    re-evaluating it.
+    """
+    lines = []
+    step = state.get("global_step")
+    total = state.get("max_steps")
+    epoch = state.get("epoch")
+    lines.append(f"progress: step {step} of {total}" + (f", {epoch:.2f} epochs done" if epoch is not None else ""))
+
+    evals = [(entry.get("step"), entry["eval_wer"]) for entry in state.get("log_history", []) if "eval_wer" in entry]
+    if not evals:
+        lines.append("no eval recorded in this checkpoint")
+        return lines
+    best_step, best_wer = min(evals, key=lambda pair: pair[1])
+    last_step, last_wer = evals[-1]
+    lines.append(f"best eval WER {best_wer:.2f}% at step {best_step} ({len(evals)} evals recorded)")
+    lines.append(f"last eval WER {last_wer:.2f}% at step {last_step}")
+    if best_step != last_step and last_wer > best_wer:
+        lines.append(
+            f"  NOTE: WER got worse after step {best_step} (+{last_wer - best_wer:.2f} points by step {last_step}). "
+            "The final-step weights are not the best ones this run produced."
+        )
+    return lines
+
+
 def dataset_already_processed(hub_dataset_id):
     """True if the processed dataset is already on the Hub.
 
@@ -434,13 +510,53 @@ def _run_job():
 
     STATE["status"] = "checking_checkpoints"
     report, usable = verify_checkpoints()
+
+    # train.py resumes from whichever checkpoint survived that check, so
+    # that is the one to ask how far the run got — and the answer decides
+    # whether there is anything to run at all.
+    #
+    # A checkpoint that already reached the epoch budget makes train.py a
+    # no-op: Trainer resumes, finds global_step at max_steps, iterates an
+    # empty range of epochs, returns without taking a single step, and
+    # pushes back the model it just loaded. Nothing about that is visible
+    # from outside — the status page goes "training" then "complete"
+    # exactly as a real run does — and on a GPU tier it bills by the
+    # minute to do it. Worse, it hides config changes: an edit to the
+    # eval schedule or the learning rate looks applied and silently never
+    # runs. Say so and stop instead.
+    epochs_done = None
+    state = training_progress(usable) if usable else None
+    if state:
+        report.extend(describe_progress(state))
+        epochs_done = state.get("epoch")
     checkpoint_report = "\n".join(report)
     print(checkpoint_report, flush=True)
     STATE["detail"] = checkpoint_report
 
+    force_train = os.environ.get("FORCE_TRAIN", "").lower() in ("1", "true", "yes")
+    if epochs_done is not None and epochs_done >= EPOCHS and not force_train:
+        STATE["status"] = "already_complete"
+        STATE["detail"] = (
+            f"{os.path.basename(usable)} has already completed {epochs_done:.2f} of the {EPOCHS} epochs "
+            "requested, so training would run 0 steps and re-push the same model.\n\n"
+            "Nothing to do here — switch this Space's hardware back to CPU Basic, or pause it.\n\n"
+            f"To train further, set an EPOCHS Space variable higher than {EPOCHS} and restart. To start a "
+            f"fresh run under changed settings, move the checkpoint-* directories out of {OUTPUT_DIR} "
+            "first. To run anyway, set FORCE_TRAIN=true.\n\n"
+            + checkpoint_report
+        )
+        return
+
     STATE["status"] = "training"
     code, tail = run_streamed(
-        [sys.executable, "train.py", "--hub-dataset-id", hub_dataset_id, "--hub-model-id", hub_model_id]
+        [
+            sys.executable, "train.py",
+            "--hub-dataset-id", hub_dataset_id,
+            "--hub-model-id", hub_model_id,
+            # Passed explicitly so EPOCHS above is the only place this
+            # number lives; train.py's own default is never relied on.
+            "--epochs", str(EPOCHS),
+        ]
     )
     if code != 0:
         STATE["status"] = "failed"
